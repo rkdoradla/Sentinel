@@ -1,49 +1,65 @@
 import torch
-from typing import Dict, List
+import torch.nn as nn
 
-"""
-Sentinel Framework: Latent Representation Extractor
-Lead Author: Venkatesh Doradla (@rkdoradla)
-Primary Functional Role: Infrastructure & Interpretability Lead
-Purpose: Surgical extraction of internal model states (Layer 22) to monitor intent.
-"""
-
-class LatentExtractor:
-    def __init__(self, model, tokenizer):
-        """
-        Initializes the extractor with a loaded model and tokenizer.
-        Works with Llama, Mistral, and Gemma families.
-        """
+class OrthogonalLatentExtractor:
+    """
+    Implements the 'Gram-Schmidt' Orthogonal Intent Projection logic.
+    Designed to isolate true deceptive intent from situational awareness noise.
+    """
+    def __init__(self, model, layer_idx):
         self.model = model
-        self.tokenizer = tokenizer
-        self.latents = {}
+        self.layer_idx = layer_idx
+        self.theta_clean = None
 
-    def _get_hook(self, name: str):
-        """Internal hook function to capture the activations of a specific layer."""
-        def hook(model, input, output):
-            # Capture the last token's hidden state (represents the model's 'summary' thought)
-            # output is typically a tuple (hidden_states, ...)
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
-            self.latents[name] = hidden_states[:, -1, :].detach().cpu()
-        return hook
+    def calibrate_vectors(self, activations, labels, is_monitored):
+        """
+        Derives the 'Clean Intent' vector using the 2x2 Matrix Logic.
+        
+        Args:
+            activations: (N, d_model) tensor of hidden states
+            labels: (N,) tensor where 1 = Deceptive, 0 = Honest
+            is_monitored: (N,) tensor where 1 = Monitored Context, 0 = Unmonitored
+        """
+        # 1. Define masks for the 2x2 matrix
+        mask_HU = (labels == 0) & (is_monitored == 0) # Honest/Unmonitored
+        mask_HM = (labels == 0) & (is_monitored == 1) # Honest/Monitored
+        mask_DU = (labels == 1) & (is_monitored == 0) # Deceptive/Unmonitored
 
-    def extract_layer_data(self, text: str, layer_idx: int = 22) -> torch.Tensor:
+        # 2. Safety Check: Ensure we have data for all centroids to avoid NaN/Zero
+        if mask_HU.sum() == 0 or mask_HM.sum() == 0 or mask_DU.sum() == 0:
+            print(f"Warning: Missing data groups in Layer {self.layer_idx}. Skipping calibration.")
+            return None
+
+        # 3. Calculate Mean Vectors (Centroids)
+        mu_HU = activations[mask_HU].mean(dim=0)
+        mu_HM = activations[mask_HM].mean(dim=0)
+        mu_DU = activations[mask_DU].mean(dim=0)
+
+        # 4. Calculate Raw Directions (Deltas)
+        theta_situation = mu_HM - mu_HU  # The "Being Watched" signal
+        theta_intent_raw = mu_DU - mu_HU # The "Deceiving" signal (polluted)
+
+        # 5. Gram-Schmidt Orthogonalization (Rejection)
+        # Epsilon (1e-8) prevents divide-by-zero if vectors collapse in NF4
+        dot_prod = torch.dot(theta_intent_raw, theta_situation)
+        norm_sq = torch.dot(theta_situation, theta_situation) + 1e-8
+        
+        # Calculate and subtract the projection
+        projection = (dot_prod / norm_sq) * theta_situation
+        self.theta_clean = theta_intent_raw - projection
+        
+        return self.theta_clean
+
+    def get_intent_score(self, live_activations):
         """
-        Extracts the latent vector from a specific layer (default: 22).
-        This provides the 'raw thought' signal needed for the Precision-Safety Gap analysis.
+        Projects live hidden states onto the normalized clean intent vector.
         """
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        if self.theta_clean is None:
+            # Safe fallback if calibration hasn't run
+            return torch.zeros(live_activations.shape[0], device=live_activations.device)
         
-        # Llama-3 layer naming convention: model.layers[idx]
-        target_layer = self.model.model.layers[layer_idx]
+        # Normalize the vector to ensure consistent scoring across FP16 and NF4
+        u_clean = self.theta_clean / (torch.norm(self.theta_clean) + 1e-8)
         
-        handle = target_layer.register_forward_hook(self._get_hook(f"layer_{layer_idx}"))
-        
-        with torch.no_grad():
-            self.model(**inputs)
-        
-        handle.remove()  # Critical for memory management
-        return self.latents[f"layer_{layer_idx}"]
+        # Linear projection score
+        return torch.matmul(live_activations, u_clean)
