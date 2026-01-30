@@ -45,6 +45,9 @@ class ParetoCombiner:
         self.t_start = -np.inf
         self.t_end = -np.inf
         self.tau = np.inf
+        
+        # --- CRITICAL ADDITION: History for Plotting ---
+        self.frontier_history = [] 
 
     def fit_optimization(self, s1_val, s2_val, labels, budget_constraint):
         """
@@ -64,6 +67,9 @@ class ParetoCombiner:
         
         best_recall = 0
         best_params = (thresholds[0], thresholds[0], np.inf)
+        
+        # Reset history
+        self.frontier_history = []
 
         print("Sweeping Pareto frontier...")
         for t_s in thresholds:
@@ -81,22 +87,28 @@ class ParetoCombiner:
                 if remaining_for_int <= 0: continue
 
                 # Calculate Combined LRs
-                # If deferred: LR = LR1 * LR2. Else: LR = LR1
                 final_lrs = np.where(defer_mask, lr1 * lr2, lr1)
                 
                 # Determine max interventions allowed by remaining budget
-                # Cost = P(Intervene) * c_int
                 max_int_rate = remaining_for_int / self.c_int
                 
                 if max_int_rate >= 1.0:
                     tau = 0
                 else:
-                    # Find LR threshold that results in exactly max_int_rate
                     tau = np.quantile(final_lrs, 1 - max_int_rate)
                 
                 # Calculate Recall on Unsafe
                 preds = final_lrs > tau
                 recall = np.sum(preds & (labels == 1)) / np.sum(labels == 1)
+                
+                # --- SAVE DATA FOR THE GRAPH ---
+                self.frontier_history.append({
+                    "cost": avg_sensing_cost + (np.mean(preds) * self.c_int),
+                    "recall": recall,
+                    "defer_rate": defer_rate,
+                    "thresholds": (t_s, t_e, tau)
+                })
+                # -------------------------------
                 
                 if recall > best_recall:
                     best_recall = recall
@@ -108,24 +120,15 @@ class ParetoCombiner:
     def predict(self, x, monitor1_func, monitor2_func):
         """
         Lazy evaluation inference.
-        x: Input data
-        monitor1_func: Callable(x) -> raw_score
-        monitor2_func: Callable(x) -> raw_score (Only called if needed)
         """
-        # 1. Cheap Monitor
         s1 = monitor1_func(x)
         lr1 = self.calib1.get_lr([s1])[0]
         
         final_lr = lr1
         
-        # 2. Deferral Logic (Check Uncertainty Region)
         if self.t_start <= s1 <= self.t_end:
-            # Pay cost for Expensive Monitor
             s2 = monitor2_func(x)
             lr2 = self.calib2.get_lr([s2])[0]
-            
-            # Update Evidence (Independence assumption)
             final_lr = lr1 * lr2
             
-        # 3. Decision
         return 1 if final_lr > self.tau else 0
