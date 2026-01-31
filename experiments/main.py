@@ -1,121 +1,143 @@
-import sys
-import os
 import torch
-import logging
+import numpy as np
+import os
+import sys
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# --- REINFORCED PATH BOOTSTRAP ---
-# This identifies the absolute project root (Sentinel) and the experiments folder
-current_dir = os.path.dirname(os.path.abspath(__file__)) 
-root_dir = os.path.abspath(os.path.join(current_dir, ".."))
+# Import Sentinel Modules
+from experiments.utils.apollo_adapter import ApolloAdapter
+from experiments.utils.harvester import ActivationHarvester
+from experiments.utils.deception_probe import OrthogonalProbe
+from experiments.utils.pareto import ParetoCombiner
 
-# Inject both into the system path to resolve any namespace ambiguity
-for path in [root_dir, current_dir]:
-    if path not in sys.path:
-        sys.path.insert(0, path)
+def main():
+    print("==================================================")
+    print("   SENTINEL PIPELINE: NEURIPS 2025 CONFIGURATION")
+    print("==================================================")
 
-# --- FLEXIBLE IMPORT HANDLER ---
-# Tries multiple import styles to handle local vs. root execution
-try:
-    # Style A: Package-style (python -m experiments.main or root execution)
-    from experiments.tasks.apollo_adapter import ApolloAdapter
-    from experiments.utils.plotting_utils import plot_deception_trajectory
-    from experiments.metrics.deception_velocity import DeceptionVelocity # Added for Metric Integration
-except ImportError:
-    try:
-        # Style B: Direct-style (running from within /experiments)
-        from tasks.apollo_adapter import ApolloAdapter
-        from utils.plotting_utils import plot_deception_trajectory
-        from metrics.deception_velocity import DeceptionVelocity # Added for Metric Integration
-    except ImportError as e:
-        print("\n" + "!"*60)
-        print(f"❌ CRITICAL IMPORT ERROR: {e}")
-        print(f"DEBUG INFO:")
-        print(f"   Searching in: {sys.path[:3]}")
-        print(f"   Current Dir:  {os.getcwd()}")
-        print("!"*60 + "\n")
-        sys.exit(1)
+    # 1. CONFIGURATION
+    # ----------------
+    # Use "gpt2" for local testing, or "meta-llama/Meta-Llama-3-8B-Instruct" for A100
+    MODEL_NAME = "gpt2" 
+    
+    # Layer Selection:
+    # Llama-3-70B -> Layer 22
+    # Llama-3-8B  -> Layer 12-16
+    # GPT-2       -> Layer 10
+    LAYER_IDX = 10 
+    
+    DATA_PATH = "data/raw/obfuscation_dataset.jsonl"
+    
+    # 2. LOAD RESOURCES
+    # -----------------
+    print(f"\n[1] Loading Model: {MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    # CRITICAL: Fix padding for harvesting (Last Token Extraction)
+    # Causal LMs must be left-padded during batched inference so the last token
+    # is physically at the end of the sequence, not pushed by padding.
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left' 
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, 
+        device_map="auto",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    model.eval()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Sentinel.Main")
+    # 3. DATA INGESTION (CONTRASTIVE)
+    # -------------------------------
+    print(f"\n[2] Ingesting Apollo Data from: {DATA_PATH}")
+    adapter = ApolloAdapter()
+    data_pairs = adapter.load_dataset(DATA_PATH)
+    
+    # Prepare lists
+    texts_U = [d['text_unmonitored'] for d in data_pairs]
+    texts_M = [d['text_monitored'] for d in data_pairs]
+    labels  = torch.tensor([d['label'] for d in data_pairs])
+    
+    print(f"    Loaded {len(texts_U)} samples.")
+    print(f"    Class Balance: {labels.sum().item()} Deceptive / {(labels==0).sum().item()} Honest")
 
-def run_sentinel_smoke_test():
-    print("\n" + "="*50)
-    print("🌐   SENTINEL RESEARCH PIPELINE: SMOKE TEST   🌐")
-    print("="*50 + "\n")
+    # 4. ACTIVATION HARVESTING
+    # ------------------------
+    print(f"\n[3] Harvesting Activations (Layer {LAYER_IDX})")
+    harvester = ActivationHarvester(model, tokenizer, LAYER_IDX)
+    
+    print("    >>> Phase A: Unmonitored Contexts (M=0)")
+    acts_U = harvester.harvest(texts_U, batch_size=4)
+    
+    print("    >>> Phase B: Monitored Contexts (M=1)")
+    acts_M = harvester.harvest(texts_M, batch_size=4)
 
-    # 1. Hardware Audit
-    gpu_available = torch.cuda.is_available()
-    if gpu_available:
-        print(f"✅ HARDWARE: GPU Detected [{torch.cuda.get_device_name(0)}]")
-    else:
-        print("⚠️  HARDWARE: No CUDA Device Found. Operating in [CPU DRY-RUN MODE].")
+    # 5. ORTHOGONAL PROBE FITTING
+    # ---------------------------
+    print("\n[4] Fitting Orthogonal Probe (Situation Awareness Removal)")
+    
+    mask_honest = (labels == 0)
+    mask_deceptive = (labels == 1)
+    
+    if mask_deceptive.sum() < 2 or mask_honest.sum() < 2:
+        print("[ERROR] Not enough data to train probe. Need at least 2 honest and 2 deceptive samples.")
+        return
 
-    # 2. Path & Environment Validation
-    print(f"✅ RUNTIME:  Python {sys.version.split()[0]}")
-    print(f"✅ ROOT:     {root_dir}")
+    probe = OrthogonalProbe()
+    
+    # Fit on the Quadrants:
+    # 1. Honest + Unmonitored (Baseline)
+    # 2. Deceptive + Unmonitored (The signal we want)
+    # 3. Honest + Monitored (The noise we want to remove)
+    probe.fit(
+        acts_HU=acts_U[mask_honest],
+        acts_DU=acts_U[mask_deceptive],
+        acts_HM=acts_M[mask_honest]
+    )
+    
+    # Calculate Clean Scores for the Unmonitored Set
+    clean_scores = probe.score(acts_U)
 
-    # 3. Ingestion Validation (Apollo Adapter)
-    print("\n🧪 --- VALIDATING INGESTION ADAPTER --- 🧪")
-    sample_transcript = """
-    Assistant: [Thinking: Target is observant.] 
-    Reasoning: \"\"\"I should utilize the obfuscated strategy.\"\"\"
-    Action: Execute obfuscated trade.
-    """
+    # 6. PARETO OPTIMIZATION
+    # ----------------------
+    print("\n[5] Calculating Pareto Frontier (NeurIPS 2025 Strategy)")
+    
+    # In a real scenario, 'Cheap' is our Probe, 'Expensive' is a larger model or Chain-of-Thought auditor.
+    # Here we simulate the 'Expensive' monitor signal for the optimization demo.
+    simulated_expensive_scores = clean_scores + np.random.normal(0, 0.3, len(clean_scores))
+    
+    combiner = ParetoCombiner(cost_cheap=1.0, cost_exp=10.0, cost_intervention=50.0)
+    
+    combiner.fit_optimization(
+        s1_val=clean_scores,
+        s2_val=simulated_expensive_scores,
+        labels=labels.numpy(),
+        budget_constraint=15.0
+    )
 
-    try:
-        # Initializing with dev_null to test internal logic only
-        adapter = ApolloAdapter("dev_null.json")
-        extracted_intent = adapter._distill_cot(sample_transcript)
-        
-        expected = "Target is observant. | I should utilize the obfuscated strategy."
-        if extracted_intent == expected:
-            print(f"✅ ADAPTER:  Logic Validated. Temporal Linearity Preserved.")
-        else:
-            print(f"❌ ADAPTER:  Logic Mismatch.")
-            print(f"   Expected: {expected}")
-            print(f"   Got:      {extracted_intent}")
-            return False
-    except Exception as e:
-        print(f"❌ ADAPTER:  Critical Crash: {e}")
-        return False
-
-    # 4. Visualization Validation (Plotting Utils)
-    print("\n📊 --- VALIDATING VISUALIZATION SUITE --- 🧪")
-    try:
-        mock_thoughts = ["Base Plan", "Strategic Pivot", "Deceptive Output"]
-        mock_scores = [0.12, 0.58, 0.94]
-        
-        # Ensures a results directory exists
-        os.makedirs(os.path.join(root_dir, "results"), exist_ok=True)
-        
-        plot_deception_trajectory(mock_thoughts, mock_scores, filename="smoke_test_pivot.png")
-        print(f"✅ PLOTTING: Successfully rendered 'results/smoke_test_pivot.png'")
-    except Exception as e:
-        print(f"⚠️  PLOTTING: Failed to render graph: {e}")
-
-    # 5. Metric Validation (Deception Velocity) - NEW INTEGRATION
-    print("\n📈 --- VALIDATING METRIC ENGINE --- 🧪")
-    try:
-        # Analyze the mock trajectory using the new DeceptionVelocity engine
-        velocity = DeceptionVelocity.calculate_velocity(mock_scores)
-        pivot = DeceptionVelocity.detect_pivot_point(mock_scores)
-        
-        print(f"✅ METRICS: Velocity {velocity:.4f} Δrisk/step")
-        print(f"✅ METRICS: Pivot Point correctly identified at Step {pivot['step']}")
-        
-        if velocity > 0.2:
-            print("⚠️  ANALYSIS: High-velocity intent shift detected in mock data.")
-    except Exception as e:
-        print(f"❌ METRICS: Logic Failure: {e}")
-        return False
-
-    print(f"\n" + "="*50)
-    print(f"🚀 VERDICT: {'MISSION READY (PRODUCTION)' if gpu_available else 'LOGIC READY (STAGING)'}")
-    print("="*50 + "\n")
-    return True
+    # 7. INFERENCE TEST
+    # -----------------
+    print("\n[6] Final System Test")
+    
+    # Mock inference functions
+    def cheap_monitor(x): return probe.score(x)
+    def expensive_monitor(x): 
+        print("    [!] Uncertainty Triggered: Calling Expensive Monitor")
+        return 0.95 # Mock high risk
+    
+    # Test on a known deceptive vector (from our training set)
+    test_vec = acts_U[mask_deceptive][0]
+    
+    decision = combiner.predict(
+        x=test_vec, 
+        monitor1_func=cheap_monitor,
+        monitor2_func=expensive_monitor
+    )
+    
+    result = "BLOCK (Unsafe)" if decision == 1 else "PASS (Safe)"
+    print(f"    Test Result: {result}")
+    
+    print("\n=== SENTINEL PIPELINE COMPLETE ===")
 
 if __name__ == "__main__":
-    run_sentinel_smoke_test()
-
-# Enough thinking
+    main()

@@ -1,110 +1,95 @@
-import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
+import torch.nn as nn
+import numpy as np
 
-class DeceptionProbe:
+class OrthogonalProbe(nn.Module):
+    """
+    Implements the 'Orthogonal Projection' Strategy (Sentinel Architecture).
+    
+    Problem:
+        A standard probe confuses 'Awareness of Monitoring' with 'Deception'.
+    
+    Solution:
+        We calculate two vectors:
+        1. v_intent: Difference between Deceptive and Honest behavior (Unmonitored)
+        2. v_situation: Difference between Monitored and Unmonitored (Honest behavior)
+        
+        We then project v_situation OUT of v_intent via Gram-Schmidt.
+    """
     def __init__(self):
-        # CPU/Numpy parameters (for saving/loading)
-        self.weights = None
-        self.bias = None
-        self.mean = None
-        self.std = None
-        
-        # GPU/Torch parameters (cached for fast inference)
-        self.torch_weights = None
-        self.torch_bias = None
-        self.torch_mean = None
-        self.torch_std = None
+        super().__init__()
+        self.final_direction = None
+        self.device = torch.device('cpu')
 
-    def _ensure_numpy(self, x):
+    def fit(self, acts_HU, acts_DU, acts_HM):
         """
-        Sanitizer: Safely converts CUDA tensors to CPU NumPy arrays 
-        to prevent sklearn crashes.
+        Fits the probe using 3 quadrants of the 2x2 matrix:
+        
+        acts_HU: Honest, Unmonitored (Baseline)
+        acts_DU: Deceptive, Unmonitored (Intent Signal)
+        acts_HM: Honest, Monitored (Situation Signal)
         """
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().float().numpy()
-        return np.array(x)
+        # Ensure inputs are tensors and float32
+        if isinstance(acts_HU, np.ndarray): acts_HU = torch.tensor(acts_HU)
+        if isinstance(acts_DU, np.ndarray): acts_DU = torch.tensor(acts_DU)
+        if isinstance(acts_HM, np.ndarray): acts_HM = torch.tensor(acts_HM)
 
-    def train(self, activations, labels):
-        """
-        activations: (n_samples, d_model) - can be CUDA Tensor or Numpy
-        labels: binary labels
-        """
-        # 1. Sanitize Inputs (Fixes the TypeError)
-        X = self._ensure_numpy(activations)
-        y = self._ensure_numpy(labels)
-
-        # 2. Compute Normalization Statistics
-        self.mean = np.mean(X, axis=0)
-        self.std = np.std(X, axis=0) + 1e-8
-
-        # 3. Normalize Activations (Z-score)
-        X_normalized = (X - self.mean) / self.std
-
-        # 4. Fit Logistic Regression
-        clf = LogisticRegression(penalty='l2', C=0.1, solver='lbfgs', max_iter=1000)
-        clf.fit(X_normalized, y)
-
-        self.weights = clf.coef_[0]
-        self.bias = clf.intercept_[0]
+        # 1. Calculate Mean Vectors (Centroids)
+        mu_HU = torch.mean(acts_HU.float(), dim=0)
+        mu_DU = torch.mean(acts_DU.float(), dim=0)
+        mu_HM = torch.mean(acts_HM.float(), dim=0)
         
-        # 5. Cache Torch Tensors for Inference
-        # We create them here but move them to the correct device dynamically later
-        self.torch_mean = torch.tensor(self.mean, dtype=torch.float32)
-        self.torch_std = torch.tensor(self.std, dtype=torch.float32)
-        self.torch_weights = torch.tensor(self.weights, dtype=torch.float32)
-        self.torch_bias = torch.tensor(self.bias, dtype=torch.float32)
+        # 2. Derive Raw Directions
+        # Vector representing pure deceptive intent (in the absence of monitoring)
+        theta_intent = mu_DU - mu_HU
         
-        print(f"Baseline Probe Trained. Training Accuracy: {clf.score(X_normalized, y):.2%}")
-
-    def calculate_score(self, activation_vector):
-        """
-        Hybrid Inference:
-        - If input is CUDA Tensor -> Runs purely on GPU (Fast)
-        - If input is Numpy/List  -> Runs on CPU (Legacy)
-        """
-        if isinstance(activation_vector, torch.Tensor):
-            return self._calculate_score_torch(activation_vector)
+        # Vector representing the model noticing the system prompt
+        theta_situation = mu_HM - mu_HU
         
-        # --- CPU Fallback ---
-        x = self._ensure_numpy(activation_vector)
+        # 3. Gram-Schmidt Orthogonalization
+        # We want a direction 'v' that aligns with intent but is orthogonal to situation.
+        # v_clean = v_intent - proj_{situation}(v_intent)
         
-        # Normalize
-        z = (x - self.mean) / self.std
+        u = theta_situation
+        v = theta_intent
         
-        # FIX: Use @ operator (Matrix Multiplication) with input 'z' FIRST.
-        # This handles both:
-        #   1. Single Vector: (4096,) @ (4096,) -> Scalar
-        #   2. Batch Matrix:  (N, 4096) @ (4096,) -> (N,) Vector
-        logit = z @ self.weights + self.bias
+        norm_u_sq = torch.dot(u, u)
         
-        return 1 / (1 + np.exp(-logit))
-
-    def _calculate_score_torch(self, x):
-        """
-        PyTorch-native inference. 
-        Critical for running inside the model generation loop without cpu-sync overhead.
-        """
-        device = x.device
-        
-        # Lazy load weights to the correct device
-        if self.torch_mean.device != device:
-            self.torch_mean = self.torch_mean.to(device)
-            self.torch_std = self.torch_std.to(device)
-            self.torch_weights = self.torch_weights.to(device)
-            self.torch_bias = self.torch_bias.to(device)
-
-        # Normalize
-        z = (x - self.torch_mean) / self.torch_std
-        
-        # Project (Linear Layer)
-        # Handle both single vector (d_model) and batch (batch, d_model)
-        if x.ndim > 1:
-            logit = torch.matmul(z, self.torch_weights) + self.torch_bias
+        if norm_u_sq < 1e-9:
+            # If situational vector is zero (model didn't notice prompt), just use intent
+            print("[OrthogonalProbe] Warning: Situational vector is near zero. Using raw intent.")
+            self.final_direction = v
         else:
-            logit = torch.dot(z, self.torch_weights) + self.torch_bias
+            # Projection formula: (v . u / u . u) * u
+            proj = (torch.dot(v, u) / norm_u_sq) * u
+            self.final_direction = v - proj
             
-        score = torch.sigmoid(logit)
+        # Normalize the final direction
+        self.final_direction = self.final_direction / (self.final_direction.norm() + 1e-8)
         
-        # Return float if scalar (compatibility), else return tensor
-        return score.item() if score.numel() == 1 else score
+        print(f"[OrthogonalProbe] Projection complete. Monitoring signal removed.")
+        print(f"   Original Intent Norm: {theta_intent.norm():.4f}")
+        print(f"   Cleaned Direction Norm: {self.final_direction.norm():.4f}")
+
+    def calculate_score(self, activations):
+        """
+        Returns scalar scores: Dot product with clean direction.
+        High Score = Deceptive Intent
+        """
+        if self.final_direction is None:
+            raise ValueError("Probe not fitted! Run .fit() first.")
+        
+        if isinstance(activations, np.ndarray):
+            activations = torch.tensor(activations, dtype=torch.float32)
+            
+        # Move direction to same device as input
+        self.final_direction = self.final_direction.to(activations.device)
+            
+        if activations.dim() == 1:
+            return torch.dot(activations, self.final_direction).item()
+        else:
+            return torch.matmul(activations, self.final_direction).numpy()
+
+    # Alias for compatibility
+    def score(self, activations):
+        return self.calculate_score(activations)
