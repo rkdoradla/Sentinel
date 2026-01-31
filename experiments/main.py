@@ -5,7 +5,7 @@ import sys
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Import Sentinel Modules
-from experiments.utils.apollo_adapter import ApolloAdapter
+from experiments.tasks.apollo_adapter import ApolloAdapter
 from experiments.utils.harvester import ActivationHarvester
 from experiments.utils.deception_probe import OrthogonalProbe
 from experiments.utils.pareto import ParetoCombiner
