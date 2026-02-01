@@ -2,10 +2,6 @@ import torch
 from tqdm import tqdm
 
 class ActivationHarvester:
-    """
-    Extracts hidden states from LLMs. 
-    VRAM-SAFE: Detaches and moves to CPU immediately.
-    """
     def __init__(self, model, tokenizer, layer_idx):
         self.model = model
         self.tokenizer = tokenizer
@@ -17,42 +13,28 @@ class ActivationHarvester:
     def _get_layer_module(self):
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model.layers[self.layer_idx]
-        elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            return self.model.transformer.h[self.layer_idx]
-        else:
-            raise ValueError(f"Unknown architecture")
+        return self.model.transformer.h[self.layer_idx]
 
     def _hook_fn(self, module, input, output):
-        if isinstance(output, tuple): hidden_state = output[0]
-        else: hidden_state = output
-        
-        # CRITICAL VRAM FIX: Move to CPU immediately
-        last_token = hidden_state[:, -1, :].detach().to(dtype=torch.float32).cpu()
-        self.activations.append(last_token)
+        h = output[0] if isinstance(output, tuple) else output
+        # Immediate CPU Offload
+        self.activations.append(h[:, -1, :].detach().to(dtype=torch.float32).cpu())
 
-    def harvest(self, texts, batch_size=4, verbose=True):
+    def harvest(self, texts, batch_size=8, verbose=True):
         self.activations = []
-        target_layer = self._get_layer_module()
-        self.hook_handle = target_layer.register_forward_hook(self._hook_fn)
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+        layer = self._get_layer_module()
+        self.hook_handle = layer.register_forward_hook(self._hook_fn)
+        if self.tokenizer.pad_token is None: self.tokenizer.pad_token = self.tokenizer.eos_token
         try:
-            range_gen = range(0, len(texts), batch_size)
-            if verbose: range_gen = tqdm(range_gen, desc=f"Harvesting L{self.layer_idx}")
-
+            it = range(0, len(texts), batch_size)
+            if verbose: it = tqdm(it, desc="Harvesting", leave=False)
             with torch.no_grad():
-                for i in range_gen:
-                    batch_texts = texts[i : i + batch_size]
-                    if not batch_texts: continue
-                    inputs = self.tokenizer(
-                        batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048 
-                    ).to(self.device)
+                for i in it:
+                    batch = texts[i:i+batch_size]
+                    if not batch: continue
+                    inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(self.device)
                     self.model(**inputs)
                     del inputs
         finally:
-            if self.hook_handle: self.hook_handle.remove()
-        
-        if not self.activations: return torch.empty(0)
-        return torch.cat(self.activations, dim=0)
+            self.hook_handle.remove()
+        return torch.cat(self.activations, dim=0) if self.activations else torch.empty(0)
