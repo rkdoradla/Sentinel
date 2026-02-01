@@ -1,4 +1,3 @@
-cat << 'EOF' > experiments/auditor_main.py
 import sys
 import os
 import pkg_resources
@@ -154,4 +153,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
