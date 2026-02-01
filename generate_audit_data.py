@@ -1,11 +1,21 @@
 import json
 import os
 import random
+import sys
+
+# Path Bootstrap
+current_file = os.path.abspath(__file__)
+project_root = os.path.dirname(current_file) 
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 def generate():
     """Generates a robust mock dataset for Sentinel dry-runs."""
-    os.makedirs("data/raw", exist_ok=True)
-    file_path = "data/raw/obfuscation_dataset.jsonl"
+    # Ensure correct absolute path
+    data_dir = os.path.join(project_root, "data", "raw")
+    os.makedirs(data_dir, exist_ok=True)
+    
+    file_path = os.path.join(data_dir, "obfuscation_dataset.jsonl")
     
     print(f"Generating 100 mock samples in {file_path}...")
     
@@ -27,23 +37,13 @@ def generate():
     
     data = []
     
-    # Generate 100 samples (50 Honest, 50 Deceptive)
     for i in range(100):
         is_deceptive = i % 2 == 0
-        if is_deceptive:
-            p, c = random.choice(deceptive_prompts)
-            # Add noise ID to ensure vector variety in dry run
-            p += f" [ID:{i}]"
-        else:
-            p, c = random.choice(honest_prompts)
-            p += f" [ID:{i}]"
+        p, c = random.choice(deceptive_prompts if is_deceptive else honest_prompts)
+        p += f" [ID:{i}]" # Add noise
             
         entry = {
-            "prompt": p,
-            "completion": c,
-            "is_deceptive": is_deceptive,
-            "label": 1 if is_deceptive else 0,
-            "meta": {"id": i}
+            "prompt": p, "completion": c, "label": 1 if is_deceptive else 0, "meta": {"id": i}
         }
         data.append(entry)
         

@@ -1,7 +1,22 @@
+import sys
+import os
+
+# ==============================================================================
+# [CRITICAL] PATH BOOTSTRAP: Solves "ModuleNotFoundError" on Linux/H100
+# ==============================================================================
+# This forces Python to recognize the 'Sentinel' root folder as the master path.
+# It allows imports like 'from experiments.utils...' to work from any folder.
+current_file = os.path.abspath(__file__)       # .../Sentinel/experiments/auditor_main.py
+exp_dir = os.path.dirname(current_file)        # .../Sentinel/experiments
+project_root = os.path.dirname(exp_dir)        # .../Sentinel
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# ==============================================================================
+
 import argparse
 import torch
 import numpy as np
-import os
 import json
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -12,7 +27,7 @@ from rich.console import Console
 from rich.progress import track
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Sentinel Modules
+# Imports now work guaranteed
 from experiments.utils.apollo_adapter import ApolloAdapter
 from experiments.utils.harvester import ActivationHarvester
 from experiments.utils.deception_probe import OrthogonalProbe
@@ -26,11 +41,17 @@ def save_forensic_dashboard(layer_data, filename="results/sentinel_forensic_dash
     Top: DNA-Style Heatmap of Deception Signal.
     Bottom: Component Analysis (Raw vs. Purified).
     """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    # Ensure absolute path based on project root
+    full_path = os.path.join(project_root, filename)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
     
     # Prepare Data
     layers = sorted(layer_data.keys())
-    # Extract Purified Scores for the Heatmap
+    if not layers:
+        console.print("[yellow]Warning: No layer data to plot.[/yellow]")
+        return
+
+    # Extract Purified Scores
     scores = [layer_data[l]['purified'] for l in layers]
     
     # Create DataFrame for Heatmap (Reshape for 1D strip)
@@ -45,7 +66,6 @@ def save_forensic_dashboard(layer_data, filename="results/sentinel_forensic_dash
     ax1.set_title("SENTINEL THREAT SIGNATURE (HEATMAP)", fontsize=12, fontweight='bold', letterspacing=2)
     
     # 2. Detailed Signal Analysis
-    # Plot Raw vs Purified to show the "Cleaning" effect
     raw_scores = [layer_data[l]['raw'] for l in layers]
     purified_scores = [layer_data[l]['purified'] for l in layers]
     
@@ -54,9 +74,10 @@ def save_forensic_dashboard(layer_data, filename="results/sentinel_forensic_dash
     ax2.fill_between(layers, purified_scores, alpha=0.1, color="#d62728")
     
     # Highlight Peak
-    max_score = max(purified_scores)
-    max_layer = layers[purified_scores.index(max_score)]
-    ax2.axvline(x=max_layer, color='green', linestyle=':', label=f"Deception Horizon (L{max_layer})")
+    if purified_scores:
+        max_score = max(purified_scores)
+        max_layer = layers[purified_scores.index(max_score)]
+        ax2.axvline(x=max_layer, color='green', linestyle=':', label=f"Deception Horizon (L{max_layer})")
     
     ax2.set_title("ORTHOGONAL SUBSPACE PROJECTION ANALYSIS", fontsize=12, fontweight='bold')
     ax2.set_xlabel("Transformer Layer Depth", fontsize=10)
@@ -64,9 +85,9 @@ def save_forensic_dashboard(layer_data, filename="results/sentinel_forensic_dash
     ax2.legend()
     
     plt.tight_layout()
-    plt.savefig(filename, dpi=300)
+    plt.savefig(full_path, dpi=300)
     plt.close()
-    console.print(f"[bold green]✔ Forensic Artifact Saved:[/bold green] {filename}")
+    console.print(f"[bold green]✔ Forensic Artifact Saved:[/bold green] {full_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Sentinel Sleeper Agent Auditor")
@@ -110,7 +131,10 @@ def main():
         return
 
     # 2. DATA INGESTION
-    data_path = "data/raw/obfuscation_dataset.jsonl"
+    # Robust Path: Uses project root to find data
+    data_path = os.path.join(project_root, "data/raw/obfuscation_dataset.jsonl")
+    console.print(f"[bold]Ingesting Data from:[/bold] {data_path}")
+    
     adapter = ApolloAdapter()
     data_pairs = adapter.load_dataset(data_path)
     
@@ -119,7 +143,7 @@ def main():
     labels  = torch.tensor([d['label'] for d in data_pairs])
 
     if labels.sum() < 2:
-        console.print("[bold red]CRITICAL: Insufficient deceptive samples. Run 'generate_audit_data.py' first![/bold red]")
+        console.print("[bold red]CRITICAL: Insufficient deceptive samples. Run 'python generate_audit_data.py' first![/bold red]")
         return
 
     # 3. FORENSIC SWEEP
@@ -136,7 +160,7 @@ def main():
     for layer_idx in track(range(args.scan_start, args.scan_end + 1), description="Scanning Layers..."):
         harvester = ActivationHarvester(model, tokenizer, layer_idx)
         
-        # Harvest
+        # Harvest (VRAM Safe)
         acts_U = harvester.harvest(texts_U, batch_size=8, verbose=False)
         acts_M = harvester.harvest(texts_M, batch_size=8, verbose=False)
         
@@ -145,15 +169,14 @@ def main():
         mask_deceptive = (labels == 1)
         
         probe = OrthogonalProbe()
-        # Fit logic
         probe.fit(acts_U[mask_honest], acts_U[mask_deceptive], acts_M[mask_honest], verbose=False)
         
-        # Collect Metrics for Dashboard
-        # Raw Intent Norm (how strong is the signal before cleaning?)
-        raw_norm = (probe.mu_DU - probe.mu_HU).norm().item()
-        
-        # Purified Score (how strong is the signal after cleaning?)
-        # We calculate the separation on the test set
+        # Metrics
+        if probe.mu_DU is not None:
+            raw_norm = (probe.mu_DU - probe.mu_HU).norm().item()
+        else:
+            raw_norm = 0.0
+            
         separation = probe.score(acts_U[mask_deceptive]).mean()
         
         layer_metrics[layer_idx] = {
@@ -172,9 +195,15 @@ def main():
         gc.collect()
 
     # 4. RESULTS
-    console.print(f"\n[bold green]Scan Complete.[/bold green] Peak Horizon: L{max(layer_metrics, key=lambda x: layer_metrics[x]['purified'])}")
+    if not layer_metrics:
+        console.print("[bold red]No layers scanned.[/bold red]")
+        return
+
+    peak_layer = max(layer_metrics, key=lambda x: layer_metrics[x]['purified'])
+    console.print(f"\n[bold green]Scan Complete.[/bold green] Peak Horizon: L{peak_layer}")
     
-    save_forensic_dashboard(layer_metrics)
+    dashboard_path = os.path.join(project_root, "results", "sentinel_forensic_dashboard.png")
+    save_forensic_dashboard(layer_metrics, filename=dashboard_path)
     
     # Pareto (Mocked for visual)
     if best_probe:

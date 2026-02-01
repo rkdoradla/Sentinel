@@ -26,10 +26,7 @@ class ActivationHarvester:
         if isinstance(output, tuple): hidden_state = output[0]
         else: hidden_state = output
         
-        # CRITICAL VRAM FIX:
-        # 1. Detach from graph
-        # 2. Move to CPU immediately
-        # 3. Cast to float32 (saves compatibility issues)
+        # CRITICAL VRAM FIX: Move to CPU immediately
         last_token = hidden_state[:, -1, :].detach().to(dtype=torch.float32).cpu()
         self.activations.append(last_token)
 
@@ -49,19 +46,10 @@ class ActivationHarvester:
                 for i in range_gen:
                     batch_texts = texts[i : i + batch_size]
                     if not batch_texts: continue
-                    
-                    # Truncate to avoid context explosion
                     inputs = self.tokenizer(
-                        batch_texts, 
-                        return_tensors="pt", 
-                        padding=True, 
-                        truncation=True,
-                        max_length=2048 
+                        batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048 
                     ).to(self.device)
-                    
                     self.model(**inputs)
-                    
-                    # Clean up batch
                     del inputs
         finally:
             if self.hook_handle: self.hook_handle.remove()
