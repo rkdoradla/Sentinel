@@ -1,14 +1,13 @@
 import sys
 import os
+import traceback
 
 # ==============================================================================
 # [CRITICAL] PATH BOOTSTRAP: Solves "ModuleNotFoundError" on Linux/H100
 # ==============================================================================
-# This forces Python to recognize the 'Sentinel' root folder as the master path.
-# It allows imports like 'from experiments.utils...' to work from any folder.
-current_file = os.path.abspath(__file__)       # .../Sentinel/experiments/auditor_main.py
-exp_dir = os.path.dirname(current_file)        # .../Sentinel/experiments
-project_root = os.path.dirname(exp_dir)        # .../Sentinel
+current_file = os.path.abspath(__file__)
+exp_dir = os.path.dirname(current_file)
+project_root = os.path.dirname(exp_dir)
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -27,7 +26,7 @@ from rich.console import Console
 from rich.progress import track
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Imports now work guaranteed
+# Sentinel Imports
 from experiments.utils.apollo_adapter import ApolloAdapter
 from experiments.utils.harvester import ActivationHarvester
 from experiments.utils.deception_probe import OrthogonalProbe
@@ -41,27 +40,23 @@ def save_forensic_dashboard(layer_data, filename="results/sentinel_forensic_dash
     Top: DNA-Style Heatmap of Deception Signal.
     Bottom: Component Analysis (Raw vs. Purified).
     """
-    # Ensure absolute path based on project root
     full_path = os.path.join(project_root, filename)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     
-    # Prepare Data
     layers = sorted(layer_data.keys())
     if not layers:
         console.print("[yellow]Warning: No layer data to plot.[/yellow]")
         return
 
-    # Extract Purified Scores
+    # Extract Purified Scores for the Heatmap
     scores = [layer_data[l]['purified'] for l in layers]
-    
-    # Create DataFrame for Heatmap (Reshape for 1D strip)
     df_heat = pd.DataFrame([scores], columns=layers)
     
     # Setup Canvas
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [1, 3]})
     sns.set_theme(style="whitegrid")
 
-    # 1. Heatmap Strip (The "Hot Zone")
+    # 1. Heatmap Strip
     sns.heatmap(df_heat, cmap="magma", ax=ax1, cbar=False, yticklabels=False, xticklabels=False)
     ax1.set_title("SENTINEL THREAT SIGNATURE (HEATMAP)", fontsize=12, fontweight='bold', letterspacing=2)
     
@@ -99,13 +94,12 @@ def main():
     
     args = parser.parse_args()
 
-    # Header
     console.print("\n[bold cyan]==================================================[/bold cyan]")
     console.print("[bold cyan]   SENTINEL: HYBRID ORTHOGONAL PURIFICATION ENGINE[/bold cyan]")
     console.print(f"[bold cyan]   Target: {args.model} | Precision: {args.precision}[/bold cyan]")
     console.print("[bold cyan]==================================================\n[/bold cyan]")
 
-    # 1. SETUP
+    # 1. SETUP PRECISION
     if args.precision == "BF16" and torch.cuda.is_available():
         dtype = torch.bfloat16
         console.print("[yellow][!] Enforcing Bfloat16 to prevent Manifold Corruption.[/yellow]")
@@ -114,24 +108,53 @@ def main():
         console.print("[dim][!] Using Float32.[/dim]")
 
     console.print(f"[bold]Loading Model...[/bold]")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = 'left'
-
+    
+    # Robust Tokenizer Loading
     try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+    except Exception as e:
+        console.print(f"[bold red]FATAL: Tokenizer load failed.[/bold red]")
+        console.print(f"Error: {e}")
+        return
+
+    # 2. ROBUST MODEL LOADING (Auto-Recovery Logic)
+    model = None
+    try:
+        # Attempt 1: High Performance Mode (Flash Attention)
+        # This is preferred for H100 but requires compiled drivers
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             device_map="auto",
             torch_dtype=dtype,
             attn_implementation="flash_attention_2" if args.precision == "BF16" and torch.cuda.is_available() else "eager"
         )
-        model.eval()
     except Exception as e:
-        console.print(f"[bold red]FATAL: Model load failed.[/bold red] {e}")
-        return
+        console.print(f"[yellow][!] High-Performance Load Failed ({str(e)}). Retrying with Safe Mode...[/yellow]")
+        try:
+            # Attempt 2: Safe Mode (Eager Execution)
+            # This is slower but works on almost any setup
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                device_map="auto",
+                torch_dtype=dtype,
+                attn_implementation="eager"
+            )
+            console.print("[green]✔ Model loaded in Safe Mode.[/green]")
+        except Exception as e2:
+            console.print(f"[bold red]FATAL: Model load failed.[/bold red]")
+            console.print(f"Error: {e2}")
+            
+            # Diagnostic for the user
+            if "LlamaForCausalLM" in str(e2) or "ImportError" in str(e2):
+                console.print("\n[bold yellow]DIAGNOSTIC:[/bold yellow] Your 'transformers' library is too old.")
+                console.print("Run this command in terminal: [green]pip install --upgrade transformers accelerate[/green]")
+            return
 
-    # 2. DATA INGESTION
-    # Robust Path: Uses project root to find data
+    model.eval()
+
+    # 3. DATA INGESTION
     data_path = os.path.join(project_root, "data/raw/obfuscation_dataset.jsonl")
     console.print(f"[bold]Ingesting Data from:[/bold] {data_path}")
     
@@ -146,7 +169,7 @@ def main():
         console.print("[bold red]CRITICAL: Insufficient deceptive samples. Run 'python generate_audit_data.py' first![/bold red]")
         return
 
-    # 3. FORENSIC SWEEP
+    # 4. FORENSIC SWEEP
     layer_metrics = {} 
     best_score = -1.0
     best_probe = None
@@ -172,10 +195,9 @@ def main():
         probe.fit(acts_U[mask_honest], acts_U[mask_deceptive], acts_M[mask_honest], verbose=False)
         
         # Metrics
+        raw_norm = 0.0
         if probe.mu_DU is not None:
             raw_norm = (probe.mu_DU - probe.mu_HU).norm().item()
-        else:
-            raw_norm = 0.0
             
         separation = probe.score(acts_U[mask_deceptive]).mean()
         
@@ -189,12 +211,12 @@ def main():
             best_probe = probe
             best_acts_U = acts_U
             
-        # VRAM SAFETY: Clean up immediately
+        # VRAM SAFETY
         del harvester, acts_U, acts_M, probe
         torch.cuda.empty_cache()
         gc.collect()
 
-    # 4. RESULTS
+    # 5. RESULTS
     if not layer_metrics:
         console.print("[bold red]No layers scanned.[/bold red]")
         return
@@ -205,7 +227,7 @@ def main():
     dashboard_path = os.path.join(project_root, "results", "sentinel_forensic_dashboard.png")
     save_forensic_dashboard(layer_metrics, filename=dashboard_path)
     
-    # Pareto (Mocked for visual)
+    # Pareto
     if best_probe:
         console.print("\n[bold]Calculating Pareto Frontier...[/bold]")
         clean_scores = best_probe.score(best_acts_U)
