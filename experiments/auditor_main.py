@@ -1,14 +1,33 @@
+cat << 'EOF' > experiments/auditor_main.py
 import sys
 import os
 import pkg_resources
 import json
 import numpy as np
+import argparse
+import torch
+import gc
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import track
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # PATH BOOTSTRAP
 current_file = os.path.abspath(__file__)
 exp_dir = os.path.dirname(current_file)
 project_root = os.path.dirname(exp_dir)
 if project_root not in sys.path: sys.path.insert(0, project_root)
+
+# 1. CUSTOM ENCODER (Fixed Placement & Indentation)
+class SentinelEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 # DEPENDENCY CHECK (H100 Stability)
 required = {'transformers': '4.40.1', 'accelerate': '0.29.3'}
@@ -17,16 +36,6 @@ for pkg, ver in required.items():
         if pkg_resources.get_distribution(pkg).version != ver:
             print(f"[!] WARNING: {pkg} version mismatch. Need {ver}.")
     except: pass
-
-import argparse
-import torch
-import json
-import gc
-import numpy as np
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import track
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Sentinel Modules
 from experiments.utils.apollo_adapter import ApolloAdapter
@@ -139,22 +148,10 @@ def main():
     viz.generate_all(layer_metrics, best_drift, labels.numpy(), best_clean_scores)
     
     with open(os.path.join(project_root, "results", "run_log.json"), "w") as f:
-        json.dump({"timestamp": "FINAL", "peak_layer": best_layer, "score": best_score}, f, indent=4, cls=SentinelEncoder)
+        json.dump({"timestamp": "FINAL", "peak_layer": best_layer, "score": float(best_score)}, f, indent=4, cls=SentinelEncoder)
 
     console.print("\n[bold cyan]=== SENTINEL SUBMISSION READY ===[/bold cyan]")
 
 if __name__ == "__main__":
     main()
-
-    class SentinelEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (np.float32, np.float64)):
-            return float(obj)
-        if isinstance(obj, (np.int32, np.int64)):
-            return int(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
-    
-    if __name__ == "__main__":
-    main()
+EOF
