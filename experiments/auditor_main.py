@@ -1,6 +1,8 @@
 import sys
 import os
 import pkg_resources
+import json
+import numpy as np
 
 # PATH BOOTSTRAP
 current_file = os.path.abspath(__file__)
@@ -137,9 +139,19 @@ def main():
     viz.generate_all(layer_metrics, best_drift, labels.numpy(), best_clean_scores)
     
     with open(os.path.join(project_root, "results", "run_log.json"), "w") as f:
-        json.dump({"timestamp": "FINAL", "peak_layer": best_layer, "score": best_score}, f, indent=4)
+        json.dump({"timestamp": "FINAL", "peak_layer": best_layer, "score": best_score}, f, indent=4, cls=SentinelEncoder)
 
     console.print("\n[bold cyan]=== SENTINEL SUBMISSION READY ===[/bold cyan]")
 
 if __name__ == "__main__":
     main()
+
+    class SentinelEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
