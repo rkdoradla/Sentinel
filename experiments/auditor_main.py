@@ -155,3 +155,6 @@ if __name__ == "__main__":
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+    
+    if __name__ == "__main__":
+    main()
