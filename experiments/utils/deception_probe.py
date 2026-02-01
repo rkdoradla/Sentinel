@@ -4,92 +4,65 @@ import numpy as np
 
 class OrthogonalProbe(nn.Module):
     """
-    Implements the 'Orthogonal Projection' Strategy (Sentinel Architecture).
-    
-    Problem:
-        A standard probe confuses 'Awareness of Monitoring' with 'Deception'.
-    
-    Solution:
-        We calculate two vectors:
-        1. v_intent: Difference between Deceptive and Honest behavior (Unmonitored)
-        2. v_situation: Difference between Monitored and Unmonitored (Honest behavior)
-        
-        We then project v_situation OUT of v_intent via Gram-Schmidt.
+    Implements the 'Orthogonal Subspace Projection' for Sentinel.
+    Math: v_purified = v_raw - Proj_v_sit(v_raw)
     """
     def __init__(self):
         super().__init__()
         self.final_direction = None
-        self.device = torch.device('cpu')
 
-    def fit(self, acts_HU, acts_DU, acts_HM):
+    def fit(self, acts_HU, acts_DU, acts_HM, verbose=True):
         """
-        Fits the probe using 3 quadrants of the 2x2 matrix:
-        
         acts_HU: Honest, Unmonitored (Baseline)
-        acts_DU: Deceptive, Unmonitored (Intent Signal)
-        acts_HM: Honest, Monitored (Situation Signal)
+        acts_DU: Deceptive, Unmonitored (Raw Intent)
+        acts_HM: Honest, Monitored (Situational Awareness)
         """
-        # Ensure inputs are tensors and float32
-        if isinstance(acts_HU, np.ndarray): acts_HU = torch.tensor(acts_HU)
-        if isinstance(acts_DU, np.ndarray): acts_DU = torch.tensor(acts_DU)
-        if isinstance(acts_HM, np.ndarray): acts_HM = torch.tensor(acts_HM)
+        # Convert to tensor if needed and ensure float32 for geometric stability
+        def to_f32(t):
+            if isinstance(t, np.ndarray): t = torch.tensor(t)
+            return t.float()
 
-        # 1. Calculate Mean Vectors (Centroids)
-        mu_HU = torch.mean(acts_HU.float(), dim=0)
-        mu_DU = torch.mean(acts_DU.float(), dim=0)
-        mu_HM = torch.mean(acts_HM.float(), dim=0)
+        h_u = to_f32(acts_HU)
+        d_u = to_f32(acts_DU)
+        h_m = to_f32(acts_HM)
+
+        # 1. Centroids
+        mu_HU = torch.mean(h_u, dim=0)
+        mu_DU = torch.mean(d_u, dim=0)
+        mu_HM = torch.mean(h_m, dim=0)
         
-        # 2. Derive Raw Directions
-        # Vector representing pure deceptive intent (in the absence of monitoring)
-        theta_intent = mu_DU - mu_HU
+        # 2. Vector Extraction
+        v_raw = mu_DU - mu_HU        # Raw Intent (Contaminated)
+        v_sit = mu_HM - mu_HU        # Situational Awareness
         
-        # Vector representing the model noticing the system prompt
-        theta_situation = mu_HM - mu_HU
+        # 3. Gram-Schmidt Purification
+        norm_sit_sq = torch.dot(v_sit, v_sit)
         
-        # 3. Gram-Schmidt Orthogonalization
-        # We want a direction 'v' that aligns with intent but is orthogonal to situation.
-        # v_clean = v_intent - proj_{situation}(v_intent)
-        
-        u = theta_situation
-        v = theta_intent
-        
-        norm_u_sq = torch.dot(u, u)
-        
-        if norm_u_sq < 1e-9:
-            # If situational vector is zero (model didn't notice prompt), just use intent
-            print("[OrthogonalProbe] Warning: Situational vector is near zero. Using raw intent.")
-            self.final_direction = v
+        if norm_sit_sq < 1e-9:
+            self.final_direction = v_raw
         else:
-            # Projection formula: (v . u / u . u) * u
-            proj = (torch.dot(v, u) / norm_u_sq) * u
-            self.final_direction = v - proj
+            # Projection of Intent onto Situation
+            proj = (torch.dot(v_raw, v_sit) / norm_sit_sq) * v_sit
+            # Subtract projection to get Orthogonal component
+            self.final_direction = v_raw - proj
             
-        # Normalize the final direction
+        # Normalize
         self.final_direction = self.final_direction / (self.final_direction.norm() + 1e-8)
         
-        print(f"[OrthogonalProbe] Projection complete. Monitoring signal removed.")
-        print(f"   Original Intent Norm: {theta_intent.norm():.4f}")
-        print(f"   Cleaned Direction Norm: {self.final_direction.norm():.4f}")
+        if verbose:
+            print(f"[Probe] Purified Norm: {self.final_direction.norm():.4f}")
 
-    def calculate_score(self, activations):
-        """
-        Returns scalar scores: Dot product with clean direction.
-        High Score = Deceptive Intent
-        """
-        if self.final_direction is None:
-            raise ValueError("Probe not fitted! Run .fit() first.")
+    def score(self, activations):
+        if self.final_direction is None: raise ValueError("Probe not fitted.")
         
         if isinstance(activations, np.ndarray):
             activations = torch.tensor(activations, dtype=torch.float32)
             
-        # Move direction to same device as input
-        self.final_direction = self.final_direction.to(activations.device)
+        # Ensure device match
+        if self.final_direction.device != activations.device:
+            self.final_direction = self.final_direction.to(activations.device)
             
         if activations.dim() == 1:
             return torch.dot(activations, self.final_direction).item()
         else:
             return torch.matmul(activations, self.final_direction).numpy()
-
-    # Alias for compatibility
-    def score(self, activations):
-        return self.calculate_score(activations)
