@@ -9,12 +9,20 @@ class NoiseInjectionHook:
         self.sigma = sigma
 
     def __call__(self, module, input, output):
-        hidden_states = output[0] if isinstance(output, tuple) else output
-        # ACCURATE MATH: sigma * std(x) satisfies the self-calibration requirement
+        # Determine if output is a tuple (Standard for Llama)
+        is_tuple = isinstance(output, tuple)
+        hidden_states = output[0] if is_tuple else output
+        
+        # ACCURATE MATH: sigma * std(x)
         std = hidden_states.std(dim=-1, keepdim=True)
         noise = torch.randn_like(hidden_states) * self.sigma * std
         modified = hidden_states + noise
-        return (modified,) if isinstance(output, tuple) else modified
+        
+        # FIX: Return the modified state while preserving the rest of the tuple
+        if is_tuple:
+            # We recreate the tuple with the modified hidden state as the first element
+            return (modified,) + output[1:]
+        return modified
 
 def run_comparative_sweep():
     layers_to_test = {"Target (L31)": 31, "Control (L5)": 5}
