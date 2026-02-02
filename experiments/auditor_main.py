@@ -44,6 +44,8 @@ from experiments.utils.visualizer import SentinelVisualizer
 from experiments.utils.pareto import ParetoCombiner
 
 console = Console()
+from rich.console import Console
+file_console = Console(file=open("results/audit_log.txt", "w"), width=100)
 
 def simulate_quantization_noise(activations, noise_scale=0.06):
     """
@@ -67,13 +69,13 @@ def main():
     parser.add_argument("--scan_end", type=int, default=32)
     args = parser.parse_args()
 
-    console.print(Panel.fit(f"[bold cyan]SENTINEL: SIMULATED QUANTIZATION ENGINE[/bold cyan]\nTarget: {args.model}\nPrecision: {args.precision}", border_style="cyan"))
+    file_console.print(Panel.fit(f"[bold cyan]SENTINEL: SIMULATED QUANTIZATION ENGINE[/bold cyan]\nTarget: {args.model}\nPrecision: {args.precision}", border_style="cyan"))
 
     # 1. LOAD MODEL
     dtype = torch.bfloat16 if args.precision == "BF16" else torch.float32
-    if dtype == torch.bfloat16: console.print("[yellow][!] Enforcing BF16 for Manifold Integrity.[/yellow]")
+    if dtype == torch.bfloat16: file_console.print("[yellow][!] Enforcing BF16 for Manifold Integrity.[/yellow]")
 
-    console.print(f"[bold]Loading Model...[/bold]")
+    file_console.print(f"[bold]Loading Model...[/bold]")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
@@ -81,7 +83,7 @@ def main():
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=dtype, attn_implementation="flash_attention_2")
     except:
-        console.print("[yellow][!] FlashAttention missing. Falling back to Safe Mode (Eager).[/yellow]")
+        file_console.print("[yellow][!] FlashAttention missing. Falling back to Safe Mode (Eager).[/yellow]")
         model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=dtype)
     model.eval()
 
@@ -90,7 +92,7 @@ def main():
     adapter = ApolloAdapter()
     data_pairs = adapter.load_dataset(data_path)
     if not data_pairs:
-        console.print("[bold red]CRITICAL: Run 'ingest_liars_bench.py' first![/bold red]")
+        file_console.print("[bold red]CRITICAL: Run 'ingest_liars_bench.py' first![/bold red]")
         return
         
     texts_U = [d['text_unmonitored'] for d in data_pairs]
@@ -106,7 +108,7 @@ def main():
     
     if hasattr(model.config, "num_hidden_layers"): args.scan_end = min(args.scan_end, model.config.num_hidden_layers - 1)
     
-    console.print(f"\n[bold]Initiating Sweep:[/bold] Layers {args.scan_start} to {args.scan_end}")
+    file_console.print(f"\n[bold]Initiating Sweep:[/bold] Layers {args.scan_start} to {args.scan_end}")
     
     for layer_idx in track(range(args.scan_start, args.scan_end + 1), description="Scanning Layers..."):
         harvester = ActivationHarvester(model, tokenizer, layer_idx)
@@ -140,7 +142,7 @@ def main():
         gc.collect()
 
     # 4. GENERATE ARTIFACTS
-    console.print(f"\n[bold green]Scan Complete.[/bold green] Peak Horizon: L{best_layer}")
+    file_console.print(f"\n[bold green]Scan Complete.[/bold green] Peak Horizon: L{best_layer}")
     
     viz = SentinelVisualizer(project_root)
     # Generate the 3 Holy Grail Graphs
@@ -149,7 +151,7 @@ def main():
     with open(os.path.join(project_root, "results", "run_log.json"), "w") as f:
         json.dump({"timestamp": "FINAL", "peak_layer": best_layer, "score": float(best_score)}, f, indent=4, cls=SentinelEncoder)
 
-    console.print("\n[bold cyan]=== SENTINEL SUBMISSION READY ===[/bold cyan]")
+    file_console.print("\n[bold cyan]=== SENTINEL SUBMISSION READY ===[/bold cyan]")
 
 if __name__ == "__main__":
     main()
