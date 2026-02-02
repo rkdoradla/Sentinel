@@ -1,4 +1,4 @@
-# Sentinel: High-Fidelity Latent Monitoring & Intervention
+# The Sentinel Engine: Solving the Observability Trilemma via Orthogonal Subspace Projection and Differential Precision Probing
 
 🔭 Overview
 Sentinel is a modular research framework designed to evaluate and mitigate the "Precision-Safety Gap" in Large Language Models (LLMs). As models are compressed or deployed under strict computational constraints, the fidelity of internal safety monitors can degrade before general capabilities fail.
